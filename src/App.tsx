@@ -1,0 +1,1409 @@
+import { invoke } from "@tauri-apps/api/core";
+import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { Menu } from "@tauri-apps/api/menu";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Editor,
+  type EditorHandle,
+} from "./components/Editor";
+import { Sidebar } from "./components/Sidebar";
+import { buildManuscriptDocument, fileTitleFor, splitManuscript } from "./lib/manuscript";
+import type {
+  AppSettings,
+  CreateAndInsertResult,
+  ManuscriptSegment,
+  ProjectFile,
+  ProjectMetadata,
+  ReorderResult,
+  SaveResult,
+} from "./lib/types";
+
+function isTauriRuntimeAvailable(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function formatError(error: unknown): string {
+  if (!isTauriRuntimeAvailable()) {
+    return "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.";
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === "string" && error.length > 0) {
+    return error;
+  }
+
+  return "Unknown error.";
+}
+
+function countStats(text: string) {
+  const normalized = text.replace(/\r\n/g, "\n");
+  const trimmed = normalized.trim();
+
+  return {
+    words: trimmed.length === 0 ? 0 : trimmed.split(/\s+/).length,
+    chars: normalized.length,
+  };
+}
+
+const numberFormatter = new Intl.NumberFormat();
+const emptyProjectMetadata: ProjectMetadata = { scenes: {} };
+
+function formatCount(value: number): string {
+  return numberFormatter.format(value);
+}
+
+function formatFolderLabel(path: string): string {
+  if (!path.trim()) {
+    return "No folder loaded";
+  }
+
+  const normalized = path.replace(/\/+$/, "");
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  const name = parts[parts.length - 1];
+  return name ? `${name} - ${path}` : path;
+}
+
+function filesAreEqual(left: ProjectFile[], right: ProjectFile[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((leftFile, index) => {
+    const rightFile = right[index];
+    return (
+      rightFile &&
+      leftFile.path === rightFile.path &&
+      leftFile.relativePath === rightFile.relativePath &&
+      leftFile.content === rightFile.content
+    );
+  });
+}
+
+function metadataAreEqual(
+  left: ProjectMetadata,
+  right: ProjectMetadata,
+): boolean {
+  return JSON.stringify(left.scenes) === JSON.stringify(right.scenes);
+}
+
+function reconcileSelectedPaths(
+  currentSelection: string[],
+  previousFiles: ProjectFile[],
+  nextFiles: ProjectFile[],
+): string[] {
+  const nextPathSet = new Set(nextFiles.map((file) => file.path));
+  const allFilesWereSelected =
+    previousFiles.length > 0 &&
+    previousFiles.every((file) => currentSelection.includes(file.path));
+
+  if (allFilesWereSelected) {
+    return nextFiles.map((file) => file.path);
+  }
+
+  return currentSelection.filter((path) => nextPathSet.has(path));
+}
+
+export function App() {
+  const [folderPath, setFolderPath] = useState("");
+  const [files, setFiles] = useState<ProjectFile[]>([]);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [manuscript, setManuscript] = useState("");
+  const [metadata, setMetadata] = useState<ProjectMetadata>(emptyProjectMetadata);
+  const [segments, setSegments] = useState<ManuscriptSegment[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [lastFocusedIndex, setLastFocusedIndex] = useState<number | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const [activeSegmentPath, setActiveSegmentPath] = useState<string | null>(null);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteLoading, setNoteLoading] = useState(false);
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteScenePath, setNoteScenePath] = useState<string | null>(null);
+  const [noteContent, setNoteContent] = useState("");
+  const [editorSelectionText, setEditorSelectionText] = useState<string | null>(null);
+  const saveInFlightRef = useRef<Promise<boolean> | null>(null);
+  const noteSaveInFlightRef = useRef<Promise<boolean> | null>(null);
+  const editorRef = useRef<EditorHandle | null>(null);
+  const externalRefreshInFlightRef = useRef(false);
+  const metadataSaveInFlightRef = useRef(0);
+  const folderPathRef = useRef(folderPath);
+  const filesRef = useRef(files);
+  const selectedPathsRef = useRef(selectedPaths);
+  const metadataRef = useRef(metadata);
+  const dirtyRef = useRef(false);
+  const loadingRef = useRef(loading);
+  const savingRef = useRef(saving);
+  const noteOpenRef = useRef(noteOpen);
+  const noteScenePathRef = useRef(noteScenePath);
+  const noteContentRef = useRef(noteContent);
+  const noteSavedContentRef = useRef("");
+  const noteLoadTokenRef = useRef(0);
+  const pointerDragSourceRef = useRef<string | null>(null);
+  const suppressClickRef = useRef(false);
+  const openFolderDialogRef = useRef<() => void>(() => {});
+  const saveSelectedRef = useRef<() => void>(() => {});
+
+  const manuscriptDocument = useMemo(
+    () => buildManuscriptDocument(files, selectedPaths),
+    [files, selectedPaths],
+  );
+  const totalText = useMemo(
+    () => files.map((file) => file.content).join("\n"),
+    [files],
+  );
+  const savePayload = useMemo(
+    () => splitManuscript(manuscript, segments),
+    [manuscript, segments],
+  );
+  const selectedText = useMemo(
+    () => savePayload.map((file) => file.content).join("\n"),
+    [savePayload],
+  );
+  const activeStats = useMemo(
+    () =>
+      countStats(
+        editorSelectionText !== null
+          ? editorSelectionText
+          : selectedPaths.length > 0
+            ? selectedText
+            : totalText,
+      ),
+    [editorSelectionText, selectedPaths.length, selectedText, totalText],
+  );
+  const noteTargetPath = activeSegmentPath ?? (selectedPaths.length === 1 ? selectedPaths[0] : null);
+  const noteTargetFile = noteTargetPath
+    ? files.find((file) => file.path === noteTargetPath)
+    : null;
+  const noteDirty = noteContent !== noteSavedContentRef.current;
+  const dirty = savePayload.some((item) => {
+    const file = files.find((currentFile) => currentFile.path === item.path);
+    return !file || file.content !== item.content;
+  });
+  const saveStateLabel = loading
+    ? "Loading..."
+    : saving
+      ? "Saving..."
+      : noteSaving
+        ? "Saving note..."
+      : dirty
+        ? "Unsaved"
+        : noteDirty
+          ? "Unsaved note"
+        : "Saved";
+
+  useEffect(() => {
+    folderPathRef.current = folderPath;
+    filesRef.current = files;
+    selectedPathsRef.current = selectedPaths;
+    metadataRef.current = metadata;
+    dirtyRef.current = dirty;
+    loadingRef.current = loading;
+    savingRef.current = saving;
+    noteOpenRef.current = noteOpen;
+    noteScenePathRef.current = noteScenePath;
+    noteContentRef.current = noteContent;
+  });
+
+  function alertError(message: string) {
+    window.alert(message);
+  }
+
+  function persistProjectMetadata(nextMetadata: ProjectMetadata, nextFolderPath = folderPath) {
+    if (!isTauriRuntimeAvailable() || !nextFolderPath.trim()) {
+      return;
+    }
+
+    metadataSaveInFlightRef.current += 1;
+
+    void invoke("save_project_metadata", {
+      folderPath: nextFolderPath.trim(),
+      metadata: nextMetadata,
+    }).catch((error) => {
+      alertError(`Metadata save failed: ${formatError(error)}`);
+    }).finally(() => {
+      metadataSaveInFlightRef.current = Math.max(
+        0,
+        metadataSaveInFlightRef.current - 1,
+      );
+    });
+  }
+
+  function metadataForFiles(
+    nextMetadata: ProjectMetadata,
+    nextFiles: ProjectFile[],
+  ): ProjectMetadata {
+    const nextScenes: ProjectMetadata["scenes"] = {};
+    const validPaths = new Set(nextFiles.map((file) => file.relativePath));
+
+    for (const [relativePath, sceneMetadata] of Object.entries(nextMetadata.scenes)) {
+      if (validPaths.has(relativePath)) {
+        nextScenes[relativePath] = sceneMetadata;
+      }
+    }
+
+    return { scenes: nextScenes };
+  }
+
+  function remapMetadata(
+    currentMetadata: ProjectMetadata,
+    currentFiles: ProjectFile[],
+    nextFiles: ProjectFile[],
+    pathMap: { oldPath: string; newPath: string }[],
+  ): ProjectMetadata {
+    const nextScenes = { ...currentMetadata.scenes };
+
+    for (const mapping of pathMap) {
+      const oldFile = currentFiles.find((file) => file.path === mapping.oldPath);
+      const newFile = nextFiles.find((file) => file.path === mapping.newPath);
+
+      if (!oldFile || !newFile || oldFile.relativePath === newFile.relativePath) {
+        continue;
+      }
+
+      const sceneMetadata = nextScenes[oldFile.relativePath];
+      delete nextScenes[oldFile.relativePath];
+
+      if (sceneMetadata) {
+        nextScenes[newFile.relativePath] = sceneMetadata;
+      }
+    }
+
+    return metadataForFiles({ scenes: nextScenes }, nextFiles);
+  }
+
+  useEffect(() => {
+    setManuscript(manuscriptDocument.manuscript);
+    setSegments(manuscriptDocument.segments);
+  }, [manuscriptDocument]);
+
+  useEffect(() => {
+    if (
+      activeSegmentPath &&
+      !selectedPaths.includes(activeSegmentPath)
+    ) {
+      setActiveSegmentPath(null);
+    }
+  }, [activeSegmentPath, selectedPaths]);
+
+  useEffect(() => {
+    if (!isTauriRuntimeAvailable()) {
+      return;
+    }
+
+    void (async () => {
+      try {
+        const settings = await invoke<AppSettings>("load_app_settings");
+        const lastOpenedFolder = settings.lastOpenedFolder?.trim();
+        if (lastOpenedFolder) {
+          await loadFolder(lastOpenedFolder);
+        }
+      } catch {
+        // Ignore settings load failures and let the app continue.
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const handleMouseUp = () => {
+      if (!pointerDragSourceRef.current) {
+        return;
+      }
+
+      const sourcePath = pointerDragSourceRef.current;
+      const insertionIndex = dropIndex;
+      pointerDragSourceRef.current = null;
+      setDropIndex(null);
+
+      if (insertionIndex === null) {
+        suppressClickRef.current = false;
+        return;
+      }
+
+      suppressClickRef.current = true;
+      void reorderFiles(sourcePath, insertionIndex);
+
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
+    };
+
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [dropIndex, files, selectedPaths, folderPath, manuscript, dirty, segments]);
+
+  async function saveSelected(): Promise<boolean> {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return false;
+    }
+
+    if (selectedPaths.length === 0) {
+      return true;
+    }
+
+    setSaving(true);
+
+    try {
+      const payload = savePayload;
+      const result = await invoke<SaveResult>("save_project", {
+        folderPath: folderPath.trim(),
+        files: payload,
+      });
+
+      const previousFiles = files;
+      const nextFiles = previousFiles.map((file) => {
+          const mappedPath =
+            result.pathMap.find((item) => item.oldPath === file.path)?.newPath ??
+            file.path;
+          const updated = result.files.find((item) => item.path === mappedPath);
+          return updated ?? file;
+      });
+      const nextMetadata = remapMetadata(
+        metadata,
+        previousFiles,
+        nextFiles,
+        result.pathMap,
+      );
+
+      setFiles(nextFiles);
+      setMetadata(nextMetadata);
+      if (result.pathMap.length > 0) {
+        persistProjectMetadata(nextMetadata);
+      }
+      setSelectedPaths((current) =>
+        current.map(
+          (path) =>
+            result.pathMap.find((item) => item.oldPath === path)?.newPath ?? path,
+        ),
+      );
+      setSegments((current) =>
+        current.map((segment) => {
+          const mappedPath =
+            result.pathMap.find((item) => item.oldPath === segment.path)?.newPath ??
+            segment.path;
+          const updatedFile = result.files.find((file) => file.path === mappedPath);
+
+          return updatedFile
+            ? {
+                ...segment,
+                path: updatedFile.path,
+                relativePath: updatedFile.relativePath,
+              }
+            : segment;
+        }),
+      );
+      setActiveSegmentPath((current) =>
+        current
+          ? result.pathMap.find((item) => item.oldPath === current)?.newPath ?? current
+          : null,
+      );
+      setNoteScenePath((current) => mapPath(result.pathMap, current));
+      return true;
+    } catch (error) {
+      alertError(`Save failed: ${formatError(error)}`);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveSelectedIfNeeded(): Promise<boolean> {
+    if (!dirty || selectedPaths.length === 0) {
+      return true;
+    }
+
+    if (saveInFlightRef.current) {
+      return saveInFlightRef.current;
+    }
+
+    const savePromise = saveSelected();
+    saveInFlightRef.current = savePromise;
+
+    try {
+      return await savePromise;
+    } finally {
+      saveInFlightRef.current = null;
+    }
+  }
+
+  function mapPath(pathMap: { oldPath: string; newPath: string }[], path: string | null) {
+    if (!path) {
+      return null;
+    }
+
+    return pathMap.find((item) => item.oldPath === path)?.newPath ?? path;
+  }
+
+  async function saveNoteIfNeeded(): Promise<boolean> {
+    const scenePath = noteScenePathRef.current;
+    const content = noteContentRef.current;
+
+    if (
+      !noteOpenRef.current ||
+      !scenePath ||
+      content === noteSavedContentRef.current
+    ) {
+      return true;
+    }
+
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return false;
+    }
+
+    if (noteSaveInFlightRef.current) {
+      return noteSaveInFlightRef.current;
+    }
+
+    setNoteSaving(true);
+    const savePromise = invoke("save_scene_note", {
+      folderPath: folderPathRef.current.trim(),
+      scenePath,
+      content,
+    })
+      .then(() => {
+        noteSavedContentRef.current = content;
+        return true;
+      })
+      .catch((error) => {
+        alertError(`Note save failed: ${formatError(error)}`);
+        return false;
+      })
+      .finally(() => {
+        noteSaveInFlightRef.current = null;
+        setNoteSaving(false);
+      });
+
+    noteSaveInFlightRef.current = savePromise;
+    return savePromise;
+  }
+
+  async function loadNoteForScene(scenePath: string) {
+    if (!isTauriRuntimeAvailable() || !folderPathRef.current.trim()) {
+      return;
+    }
+
+    const saved = await saveNoteIfNeeded();
+    if (!saved) {
+      return;
+    }
+
+    const token = noteLoadTokenRef.current + 1;
+    noteLoadTokenRef.current = token;
+    setNoteLoading(true);
+
+    try {
+      const content = await invoke<string>("load_scene_note", {
+        folderPath: folderPathRef.current.trim(),
+        scenePath,
+      });
+
+      if (noteLoadTokenRef.current !== token) {
+        return;
+      }
+
+      noteSavedContentRef.current = content;
+      setNoteContent(content);
+      setNoteScenePath(scenePath);
+    } catch (error) {
+      alertError(`Note load failed: ${formatError(error)}`);
+    } finally {
+      if (noteLoadTokenRef.current === token) {
+        setNoteLoading(false);
+      }
+    }
+  }
+
+  async function toggleNotePanel() {
+    if (noteOpen) {
+      const saved = await saveNoteIfNeeded();
+      if (!saved) {
+        return;
+      }
+
+      setNoteOpen(false);
+      setNoteScenePath(null);
+      setNoteContent("");
+      noteSavedContentRef.current = "";
+      return;
+    }
+
+    if (!noteTargetPath) {
+      alertError("Put the cursor in one scene or select a single scene first.");
+      return;
+    }
+
+    setNoteOpen(true);
+    await loadNoteForScene(noteTargetPath);
+  }
+
+  async function loadFolder(nextFolderPath: string) {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return;
+    }
+
+    const trimmedFolderPath = nextFolderPath.trim();
+
+    if (!trimmedFolderPath) {
+      return;
+    }
+
+    const noteSaved = await saveNoteIfNeeded();
+    const saved = await saveSelectedIfNeeded();
+    if (!saved || !noteSaved) {
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const loadedFiles = await invoke<ProjectFile[]>("load_project", {
+        folderPath: trimmedFolderPath,
+      });
+      const loadedMetadata = await invoke<ProjectMetadata>("load_project_metadata", {
+        folderPath: trimmedFolderPath,
+      });
+      await invoke("save_app_settings", {
+        settings: { lastOpenedFolder: trimmedFolderPath },
+      });
+      setFolderPath(trimmedFolderPath);
+      setFiles(loadedFiles);
+      setMetadata(metadataForFiles(loadedMetadata, loadedFiles));
+      setSelectedPaths(loadedFiles.map((file) => file.path));
+      setLastFocusedIndex(loadedFiles.length > 0 ? 0 : null);
+      setNoteOpen(false);
+      setNoteScenePath(null);
+      setNoteContent("");
+      noteSavedContentRef.current = "";
+    } catch (error) {
+      alertError(`Load failed: ${formatError(error)}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshProjectFromDisk() {
+    if (
+      !isTauriRuntimeAvailable() ||
+      externalRefreshInFlightRef.current ||
+      !folderPathRef.current.trim() ||
+      dirtyRef.current ||
+      noteContentRef.current !== noteSavedContentRef.current ||
+      loadingRef.current ||
+      savingRef.current ||
+      metadataSaveInFlightRef.current > 0
+    ) {
+      return;
+    }
+
+    externalRefreshInFlightRef.current = true;
+
+    try {
+      const currentFolderPath = folderPathRef.current.trim();
+      const loadedFiles = await invoke<ProjectFile[]>("load_project", {
+        folderPath: currentFolderPath,
+      });
+      const loadedMetadata = await invoke<ProjectMetadata>("load_project_metadata", {
+        folderPath: currentFolderPath,
+      });
+      const nextMetadata = metadataForFiles(loadedMetadata, loadedFiles);
+      const currentFiles = filesRef.current;
+      const currentMetadata = metadataRef.current;
+
+      if (
+        filesAreEqual(currentFiles, loadedFiles) &&
+        metadataAreEqual(currentMetadata, nextMetadata)
+      ) {
+        return;
+      }
+
+      const nextSelectedPaths = reconcileSelectedPaths(
+        selectedPathsRef.current,
+        currentFiles,
+        loadedFiles,
+      );
+      const nextSelectedPathSet = new Set(nextSelectedPaths);
+
+      setFiles(loadedFiles);
+      setMetadata(nextMetadata);
+      setSelectedPaths(nextSelectedPaths);
+      const nextFocusedIndex = loadedFiles.findIndex((file) =>
+        nextSelectedPathSet.has(file.path),
+      );
+      setLastFocusedIndex(nextFocusedIndex >= 0 ? nextFocusedIndex : null);
+      setActiveSegmentPath((current) =>
+        current && loadedFiles.some((file) => file.path === current)
+          ? current
+          : null,
+      );
+    } catch {
+      // External refresh is opportunistic. Explicit load/save actions still alert.
+    } finally {
+      externalRefreshInFlightRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    if (!isTauriRuntimeAvailable()) {
+      return;
+    }
+
+    const refresh = () => {
+      void refreshProjectFromDisk();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refresh();
+      }
+    };
+
+    refresh();
+    const intervalId = window.setInterval(refresh, 1000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!noteOpen) {
+      return;
+    }
+
+    if (!noteTargetPath) {
+      void saveNoteIfNeeded().then((saved) => {
+        if (saved) {
+          setNoteScenePath(null);
+          setNoteContent("");
+          noteSavedContentRef.current = "";
+        }
+      });
+      return;
+    }
+
+    if (noteScenePath !== noteTargetPath) {
+      void loadNoteForScene(noteTargetPath);
+    }
+  }, [noteOpen, noteTargetPath, noteScenePath]);
+
+  async function openFolderDialog() {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return;
+    }
+
+    try {
+      const selected = await open({
+        title: "Open Manuscript Folder",
+        directory: true,
+        multiple: false,
+        defaultPath: folderPath.trim() || undefined,
+      });
+
+      if (typeof selected !== "string") {
+        return;
+      }
+
+      await loadFolder(selected);
+    } catch (error) {
+      alertError(`Folder selection failed: ${formatError(error)}`);
+    }
+  }
+
+  async function sendSelectionToNewFile() {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return;
+    }
+
+    if (!folderPath.trim()) {
+      alertError("Load a folder before splitting scenes.");
+      return;
+    }
+
+    const extraction = editorRef.current?.getSelectionExtraction();
+    if (!extraction) {
+      alertError("Select text inside one scene first.");
+      return;
+    }
+
+    const noteSaved = await saveNoteIfNeeded();
+    if (!noteSaved) {
+      return;
+    }
+
+    const nextPayload = savePayload.map((file) =>
+      file.path === extraction.sourcePath
+        ? {
+            ...file,
+            content:
+              file.content.slice(0, extraction.fromOffset) +
+              file.content.slice(extraction.toOffset),
+          }
+        : file,
+    );
+
+    try {
+      const result = await invoke<CreateAndInsertResult>("extract_selection_to_file", {
+        payload: {
+          folderPath: folderPath.trim(),
+          orderedPaths: files.map((file) => file.path),
+          sourcePath: extraction.sourcePath,
+          files: nextPayload,
+          extractedContent: extraction.text,
+        },
+      });
+      const nextMetadata = remapMetadata(
+        metadata,
+        files,
+        result.files,
+        result.pathMap,
+      );
+      const focusedIndex = result.files.findIndex(
+        (file) => file.path === result.createdPath,
+      );
+
+      setFiles(result.files);
+      setMetadata(nextMetadata);
+      if (result.pathMap.length > 0) {
+        persistProjectMetadata(nextMetadata);
+      }
+      setSelectedPaths([result.createdPath]);
+      setLastFocusedIndex(focusedIndex >= 0 ? focusedIndex : null);
+      setActiveSegmentPath(result.createdPath);
+      setNoteScenePath((current) => mapPath(result.pathMap, current));
+    } catch (error) {
+      alertError(`Split failed: ${formatError(error)}`);
+    }
+  }
+
+  async function showContextMenu(
+    x: number,
+    y: number,
+    canUseEditorSelection: boolean,
+  ) {
+    if (!isTauriRuntimeAvailable()) {
+      return;
+    }
+
+    try {
+      const canExtractSelection =
+        canUseEditorSelection &&
+        Boolean(editorRef.current?.getSelectionExtraction());
+      const menu = await Menu.new({
+        items: [
+          { item: "Cut" },
+          { item: "Copy" },
+          { item: "Paste" },
+          { item: "Separator" },
+          {
+            text: "Send Selection to New File",
+            enabled: canExtractSelection,
+            action: () => {
+              void sendSelectionToNewFile();
+            },
+          },
+        ],
+      });
+
+      await menu.popup(new LogicalPosition(x, y));
+    } catch (error) {
+      alertError(`Context menu failed: ${formatError(error)}`);
+    }
+  }
+
+  async function applySelection(
+    nextSelection: string[],
+    focusedIndex: number | null,
+  ) {
+    const noteSaved = await saveNoteIfNeeded();
+    const saved = await saveSelectedIfNeeded();
+    if (!saved || !noteSaved) {
+      return;
+    }
+
+    setSelectedPaths(nextSelection);
+    setLastFocusedIndex(focusedIndex);
+  }
+
+  function selectAll() {
+    void applySelection(
+      files.map((file) => file.path),
+      files.length > 0 ? 0 : null,
+    );
+  }
+
+  async function createFile() {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return;
+    }
+
+    if (!folderPath.trim()) {
+      alertError("Load a folder before creating files.");
+      return;
+    }
+
+    const noteSaved = await saveNoteIfNeeded();
+    const saved = await saveSelectedIfNeeded();
+    if (!saved || !noteSaved) {
+      return;
+    }
+
+    try {
+      const result = await invoke<CreateAndInsertResult>("create_and_insert_file", {
+        payload: {
+          folderPath: folderPath.trim(),
+          orderedPaths: files.map((file) => file.path),
+          selectedPaths,
+        },
+      });
+
+      const focusedIndex = result.files.findIndex(
+        (file) => file.path === result.createdPath,
+      );
+      const nextMetadata = remapMetadata(
+        metadata,
+        files,
+        result.files,
+        result.pathMap,
+      );
+
+      setFiles(result.files);
+      setMetadata(nextMetadata);
+      if (result.pathMap.length > 0) {
+        persistProjectMetadata(nextMetadata);
+      }
+      setSelectedPaths([result.createdPath]);
+      setLastFocusedIndex(focusedIndex);
+      setNoteScenePath((current) => mapPath(result.pathMap, current));
+    } catch (error) {
+      alertError(`Create failed: ${formatError(error)}`);
+    }
+  }
+
+  async function deleteSelected() {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return;
+    }
+
+    if (selectedPaths.length === 0) {
+      return;
+    }
+
+    const confirmed = await confirm(
+      `Delete ${selectedPaths.length} selected file(s)?`,
+      {
+        title: "Delete files",
+        kind: "warning",
+      },
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const noteSaved = await saveNoteIfNeeded();
+    const saved = await saveSelectedIfNeeded();
+    if (!saved || !noteSaved) {
+      return;
+    }
+
+    try {
+      await Promise.all(
+        selectedPaths.map((path) =>
+          invoke("delete_file", {
+            payload: {
+              folderPath: folderPath.trim(),
+              path,
+            },
+          }),
+        ),
+      );
+
+      const nextFiles = files.filter((file) => !selectedPaths.includes(file.path));
+      const nextMetadata = metadataForFiles(metadata, nextFiles);
+
+      setFiles(nextFiles);
+      setMetadata(nextMetadata);
+      persistProjectMetadata(nextMetadata);
+      setSelectedPaths([]);
+      setLastFocusedIndex(null);
+      setNoteScenePath((current) =>
+        current && selectedPaths.includes(current) ? null : current,
+      );
+      if (noteScenePathRef.current && selectedPaths.includes(noteScenePathRef.current)) {
+        setNoteOpen(false);
+        setNoteContent("");
+        noteSavedContentRef.current = "";
+      }
+    } catch (error) {
+      alertError(`Delete failed: ${formatError(error)}`);
+    }
+  }
+
+  async function renameFile(path: string, title: string): Promise<boolean> {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return false;
+    }
+
+    if (!folderPath.trim()) {
+      alertError("Load a folder before renaming files.");
+      return false;
+    }
+
+    const noteSaved = await saveNoteIfNeeded();
+    const saved = await saveSelectedIfNeeded();
+    if (!saved || !noteSaved) {
+      return false;
+    }
+
+    try {
+      const renamedFile = await invoke<ProjectFile>("rename_file", {
+        payload: {
+          folderPath: folderPath.trim(),
+          path,
+          title,
+        },
+      });
+
+      const nextFiles = files.map((file) =>
+        file.path === path ? renamedFile : file,
+      );
+      const nextMetadata = remapMetadata(metadata, files, nextFiles, [
+        { oldPath: path, newPath: renamedFile.path },
+      ]);
+
+      setFiles(nextFiles);
+      setMetadata(nextMetadata);
+      persistProjectMetadata(nextMetadata);
+      setSelectedPaths((current) =>
+        current.map((selectedPath) =>
+          selectedPath === path ? renamedFile.path : selectedPath,
+        ),
+      );
+      setActiveSegmentPath((current) =>
+        current === path ? renamedFile.path : current,
+      );
+      setNoteScenePath((current) =>
+        current === path ? renamedFile.path : current,
+      );
+      return true;
+    } catch (error) {
+      alertError(`Rename failed: ${formatError(error)}`);
+      return false;
+    }
+  }
+
+  async function reorderFiles(dragSourcePath: string, insertionIndex: number) {
+    if (!isTauriRuntimeAvailable()) {
+      alertError(
+        "Tauri runtime is not available. Start the app with `npm run tauri dev`, not `npm run dev`.",
+      );
+      return;
+    }
+
+    if (!folderPath.trim()) {
+      return;
+    }
+
+    const noteSaved = await saveNoteIfNeeded();
+    const saved = await saveSelectedIfNeeded();
+    if (!saved || !noteSaved) {
+      return;
+    }
+
+    const movingPaths =
+      selectedPaths.includes(dragSourcePath) && selectedPaths.length > 1
+        ? files
+            .filter((file) => selectedPaths.includes(file.path))
+            .map((file) => file.path)
+        : [dragSourcePath];
+
+    const movedFiles = files.filter((file) => movingPaths.includes(file.path));
+    const withoutMoved = files.filter((file) => !movingPaths.includes(file.path));
+
+    const sourceFirstIndex = files.findIndex((file) => file.path === movingPaths[0]);
+    const singleFileNoop =
+      movingPaths.length === 1 &&
+      sourceFirstIndex !== -1 &&
+      (insertionIndex === sourceFirstIndex || insertionIndex === sourceFirstIndex + 1);
+    const movingBeforeInsertion = files
+      .slice(0, insertionIndex)
+      .filter((file) => movingPaths.includes(file.path)).length;
+    const adjustedInsertionIndex = insertionIndex - movingBeforeInsertion;
+
+    if (
+      adjustedInsertionIndex < 0 ||
+      adjustedInsertionIndex > withoutMoved.length ||
+      singleFileNoop
+    ) {
+      return;
+    }
+
+    const reorderedFiles = [
+      ...withoutMoved.slice(0, adjustedInsertionIndex),
+      ...movedFiles,
+      ...withoutMoved.slice(adjustedInsertionIndex),
+    ];
+
+    try {
+      const result = await invoke<ReorderResult>("reorder_files", {
+        payload: {
+          folderPath: folderPath.trim(),
+          orderedPaths: reorderedFiles.map((file) => file.path),
+        },
+      });
+
+      const mappedSelection = selectedPaths
+        .map(
+          (path) =>
+            result.pathMap.find((item) => item.oldPath === path)?.newPath ?? path,
+        )
+        .filter((path) => result.files.some((file) => file.path === path));
+
+      const mappedFocusedPath =
+        lastFocusedIndex !== null ? files[lastFocusedIndex]?.path : null;
+      const nextFocusedPath =
+        mappedFocusedPath === null
+          ? null
+          : result.pathMap.find((item) => item.oldPath === mappedFocusedPath)?.newPath ??
+            mappedFocusedPath;
+      const nextFocusedIndex =
+        nextFocusedPath === null
+          ? null
+          : result.files.findIndex((file) => file.path === nextFocusedPath);
+      const nextMetadata = remapMetadata(
+        metadata,
+        files,
+        result.files,
+        result.pathMap,
+      );
+
+      setFiles(result.files);
+      setMetadata(nextMetadata);
+      persistProjectMetadata(nextMetadata);
+      setActiveSegmentPath((current) =>
+        current
+          ? result.pathMap.find((item) => item.oldPath === current)?.newPath ?? current
+          : null,
+      );
+      setNoteScenePath((current) => mapPath(result.pathMap, current));
+      setSelectedPaths(mappedSelection);
+      setLastFocusedIndex(
+        typeof nextFocusedIndex === "number" && nextFocusedIndex >= 0
+          ? nextFocusedIndex
+          : null,
+      );
+    } catch (error) {
+      alertError(`Reorder failed: ${formatError(error)}`);
+    }
+  }
+
+  function handleRowClick(
+    path: string,
+    index: number,
+    event: React.MouseEvent<HTMLButtonElement>,
+  ) {
+    if (suppressClickRef.current) {
+      event.preventDefault();
+      return;
+    }
+
+    const commandKey = event.metaKey || event.ctrlKey;
+
+    if (event.shiftKey && lastFocusedIndex !== null) {
+      const start = Math.min(lastFocusedIndex, index);
+      const end = Math.max(lastFocusedIndex, index);
+      const range = files.slice(start, end + 1).map((file) => file.path);
+      void applySelection(range, index);
+      return;
+    }
+
+    if (commandKey) {
+      const next = selectedPaths.includes(path)
+        ? selectedPaths.filter((item) => item !== path)
+        : [...selectedPaths, path];
+      void applySelection(next, index);
+      return;
+    }
+
+    void applySelection([path], index);
+  }
+
+  function setSceneEmoji(emoji: string) {
+    const targetPaths =
+      selectedPaths.length > 0
+        ? selectedPaths
+        : activeSegmentPath
+          ? [activeSegmentPath]
+          : [];
+
+    if (targetPaths.length === 0) {
+      return;
+    }
+
+    const targetRelativePaths = files
+      .filter((file) => targetPaths.includes(file.path))
+      .map((file) => file.relativePath);
+    const nextMetadata: ProjectMetadata = {
+      scenes: { ...metadata.scenes },
+    };
+
+    for (const relativePath of targetRelativePaths) {
+      nextMetadata.scenes[relativePath] = { emoji };
+    }
+
+    setMetadata(nextMetadata);
+    persistProjectMetadata(nextMetadata);
+  }
+
+  useEffect(() => {
+    const handleBlur = () => {
+      void saveSelectedIfNeeded();
+      void saveNoteIfNeeded();
+    };
+
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, [dirty, manuscript, selectedPaths, files, segments, noteOpen, noteContent, noteScenePath]);
+
+  useEffect(() => {
+    openFolderDialogRef.current = () => {
+      void openFolderDialog();
+    };
+    saveSelectedRef.current = () => {
+      void saveSelected();
+    };
+  });
+
+  useEffect(() => {
+    if (!isTauriRuntimeAvailable()) {
+      return;
+    }
+
+    const handleOpenFolder = () => openFolderDialogRef.current();
+    const handleSave = () => saveSelectedRef.current();
+
+    window.addEventListener("letrum:open-folder", handleOpenFolder);
+    window.addEventListener("letrum:save", handleSave);
+
+    void (async () => {
+      try {
+        const menu = await Menu.new({
+          items: [
+            {
+              text: "File",
+              items: [
+                {
+                  id: "open-folder",
+                  text: "Open Folder...",
+                  accelerator: "CmdOrCtrl+O",
+                  action: () => {
+                    window.dispatchEvent(new Event("letrum:open-folder"));
+                  },
+                },
+                { item: "Separator" },
+                {
+                  id: "save",
+                  text: "Save",
+                  accelerator: "CmdOrCtrl+S",
+                  action: () => {
+                    window.dispatchEvent(new Event("letrum:save"));
+                  },
+                },
+                { item: "Separator" },
+                { item: "Quit", text: "Quit" },
+              ],
+            },
+            {
+              text: "Edit",
+              items: [
+                { item: "Undo" },
+                { item: "Redo" },
+                { item: "Separator" },
+                { item: "Cut" },
+                { item: "Copy" },
+                { item: "Paste" },
+                { item: "SelectAll" },
+              ],
+            },
+          ],
+        });
+        await menu.setAsAppMenu();
+      } catch (error) {
+        alertError(`Menu setup failed: ${formatError(error)}`);
+      }
+    })();
+
+    return () => {
+      window.removeEventListener("letrum:open-folder", handleOpenFolder);
+      window.removeEventListener("letrum:save", handleSave);
+    };
+  }, []);
+
+  return (
+    <div
+      className="app-shell"
+      onContextMenu={(event) => {
+        event.preventDefault();
+        const isEditorContext =
+          event.target instanceof Element &&
+          Boolean(event.target.closest(".editor"));
+
+        if (isEditorContext) {
+          void showContextMenu(event.clientX, event.clientY, true);
+        }
+      }}
+    >
+      <main className="workspace">
+        <Sidebar
+          files={files}
+          selectedPaths={selectedPaths}
+          activePath={activeSegmentPath}
+          metadata={metadata}
+          dropIndex={dropIndex}
+          onRowClick={handleRowClick}
+          onSelectAll={selectAll}
+          onCreateFile={createFile}
+          onDeleteSelected={deleteSelected}
+          onRenameFile={renameFile}
+          onSetSceneEmoji={setSceneEmoji}
+          onPointerDragStart={(path) => {
+            pointerDragSourceRef.current = path;
+            setDropIndex(null);
+          }}
+          onSetDropIndex={(index) => {
+            if (!pointerDragSourceRef.current) {
+              return;
+            }
+
+            setDropIndex(index);
+          }}
+          onPointerDragEnd={() => {
+            if (!pointerDragSourceRef.current) {
+              return;
+            }
+
+            const sourcePath = pointerDragSourceRef.current;
+            const nextDropIndex = dropIndex;
+            pointerDragSourceRef.current = null;
+            setDropIndex(null);
+
+            if (nextDropIndex === null) {
+              return;
+            }
+
+            suppressClickRef.current = true;
+            void reorderFiles(sourcePath, nextDropIndex);
+
+            window.setTimeout(() => {
+              suppressClickRef.current = false;
+            }, 0);
+          }}
+        />
+        <section className={`editor-panel${noteOpen ? " editor-panel--split" : ""}`}>
+          <div className="editor-panel__main">
+            <Editor
+              ref={editorRef}
+              value={manuscript}
+              segments={segments}
+              readOnly={selectedPaths.length === 0}
+              onChange={(nextManuscript, nextSegments) => {
+                setManuscript(nextManuscript);
+                setSegments(nextSegments);
+              }}
+              onActiveSegmentChange={setActiveSegmentPath}
+              onSelectedTextChange={setEditorSelectionText}
+              blurSignal={selectedPaths.join("\n")}
+              onBlur={() => {
+                void saveSelectedIfNeeded();
+              }}
+            />
+          </div>
+          {noteOpen ? (
+            <aside className="note-pane">
+              <div className="note-pane__header">
+                <span>
+                  {noteTargetFile ? fileTitleFor(noteTargetFile.relativePath) : ""}
+                </span>
+              </div>
+              <textarea
+                value={noteContent}
+                onChange={(event) => {
+                  setNoteContent(event.target.value);
+                }}
+                onBlur={() => {
+                  void saveNoteIfNeeded();
+                }}
+                disabled={noteLoading || !noteScenePath}
+                spellCheck
+                aria-label="Scene note"
+              />
+            </aside>
+          ) : null}
+        </section>
+      </main>
+
+      <footer className="statusbar">
+        <span className="statusbar__folder" title={folderPath || undefined}>
+          {formatFolderLabel(folderPath)}
+        </span>
+        <div
+          className={`statusbar__stats${editorSelectionText !== null ? " statusbar__stats--selection" : ""}`}
+          aria-label="Document statistics"
+        >
+          <span>
+            <strong>{formatCount(activeStats.words)}</strong> words
+          </span>
+          <span>
+            <strong>{formatCount(activeStats.chars)}</strong> chars
+          </span>
+        </div>
+        <span className="statusbar__save-state">
+          <button
+            type="button"
+            className="statusbar__note"
+            onClick={() => {
+              void toggleNotePanel();
+            }}
+            disabled={!folderPath.trim() || noteLoading || (!noteOpen && !noteTargetPath)}
+          >
+            {noteOpen ? "Close Note" : "Note"}
+          </button>
+          {saveStateLabel}
+        </span>
+      </footer>
+    </div>
+  );
+}
